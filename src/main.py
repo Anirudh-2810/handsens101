@@ -1,96 +1,93 @@
 import cv2
 import mediapipe as mp
 import pyautogui
-import math
 import numpy as np
+import os
+import urllib.request
 import sys
 
-class JarvisInterface:
+class ModernVisionUI:
     def __init__(self):
-        # 1. Bootstrapping & Hardware Check
-        pyautogui.FAILSAFE = False  # Prevents crash if cursor hits corners
-        self.cap = cv2.VideoCapture(0)
-        if not self.cap.isOpened():
-            print("Error: Could not access webcam. Ensure no other app is using it.")
-            sys.exit()
+        pyautogui.FAILSAFE = False
+        self.model_path = "hand_landmarker.task"
+        self._fetch_model()
+        
+        # Modern MediaPipe Tasks API Initialization
+        BaseOptions = mp.tasks.BaseOptions
+        HandLandmarker = mp.tasks.vision.HandLandmarker
+        HandLandmarkerOptions = mp.tasks.vision.HandLandmarkerOptions
+        VisionRunningMode = mp.tasks.vision.RunningMode
 
-        # 2. Initialize MediaPipe Engine
-        self.mp_hands = mp.solutions.hands
-        self.hands = self.mp_hands.Hands(
-            static_image_mode=False,
-            max_num_hands=1,
-            min_detection_confidence=0.8,
-            min_tracking_confidence=0.8
+        options = HandLandmarkerOptions(
+            base_options=BaseOptions(model_asset_path=self.model_path),
+            running_mode=VisionRunningMode.IMAGE,
+            num_hands=1,
+            min_hand_detection_confidence=0.7
         )
-        self.mp_draw = mp.solutions.drawing_utils
+        self.detector = HandLandmarker.create_from_options(options)
         
-        # 3. Screen Dimensions & Smoothing Setup
         self.screen_w, self.screen_h = pyautogui.size()
-        self.smooth_factor = 7  # Higher = smoother but slower; Lower = faster but shakier
+        self.cap = cv2.VideoCapture(0)
         self.ploc_x, self.ploc_y = 0, 0
-        self.cloc_x, self.cloc_y = 0, 0
-        
-        # 4. Define Active Zone (Padding)
-        # We use a box in the center of the camera so you don't have to reach across the room
-        self.frame_pad = 100 
+        self.smooth = 5
 
-    def start_system(self):
-        print("Jarvis Vision UI: Online")
-        print("Controls: Index Finger = Move | Pinch (Index + Thumb) = Click | 'q' = Quit")
+    def _fetch_model(self):
+        """Fetches the required Edge ML model directly from Google storage."""
+        if not os.path.exists(self.model_path):
+            print("System: Fetching ML Model dependencies...")
+            url = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
+            urllib.request.urlretrieve(url, self.model_path)
+
+    def execute(self):
+        if not self.cap.isOpened():
+            sys.exit("CRITICAL EXCEPTION: HID Camera stream inaccessible. Check OS permissions.")
+
+        print("System Online: Tracking Active.")
         
         while True:
-            success, img = self.cap.read()
-            if not success: break
+            ret, frame = self.cap.read()
+            if not ret: 
+                continue
 
-            # Flip image for mirror effect
-            img = cv2.flip(img, 1)
-            h, w, _ = img.shape
+            # Matrix transformations for natural UX
+            frame = cv2.flip(frame, 1)
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
             
-            # Convert to RGB for MediaPipe
-            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            results = self.hands.process(img_rgb)
+            # Neural network inference
+            results = self.detector.detect(mp_image)
 
-            if results.multi_hand_landmarks:
-                for hand_lms in results.multi_hand_landmarks:
-                    # Draw visual feedback on the window
-                    self.mp_draw.draw_landmarks(img, hand_lms, self.mp_hands.HAND_CONNECTIONS)
-                    
-                    # Get Landmarks: 8 (Index Tip), 4 (Thumb Tip)
-                    index_tip = hand_lms.landmark[8]
-                    thumb_tip = hand_lms.landmark[4]
+            if results.hand_landmarks:
+                hand = results.hand_landmarks[0]
+                idx_tip = hand[8]
+                thumb_tip = hand[4]
 
-                    # Map Camera Coordinates to Screen Coordinates
-                    # Use np.interp to scale the 'Active Zone' to full screen size
-                    tx = np.interp(index_tip.x * w, (self.frame_pad, w - self.frame_pad), (0, self.screen_w))
-                    ty = np.interp(index_tip.y * h, (self.frame_pad, h - self.frame_pad), (0, self.screen_h))
+                # Spatial Interpolation (Camera Space -> Monitor Space)
+                tx = np.interp(idx_tip.x, [0.1, 0.9], [0, self.screen_w])
+                ty = np.interp(idx_tip.y, [0.1, 0.9], [0, self.screen_h])
 
-                    # Apply Smoothing (Current Location = Previous + (Target - Previous) / Smoothing)
-                    self.cloc_x = self.ploc_x + (tx - self.ploc_x) / self.smooth_factor
-                    self.cloc_y = self.ploc_y + (ty - self.ploc_y) / self.smooth_factor
+                # Exponential Moving Average for signal smoothing
+                cloc_x = self.ploc_x + (tx - self.ploc_x) / self.smooth
+                cloc_y = self.ploc_y + (ty - self.ploc_y) / self.smooth
 
-                    # Move Cursor
-                    pyautogui.moveTo(self.cloc_x, self.cloc_y)
-                    self.ploc_x, self.ploc_y = self.cloc_x, self.cloc_y
+                pyautogui.moveTo(cloc_x, cloc_y)
+                self.ploc_x, self.ploc_y = cloc_x, cloc_y
 
-                    # Detect Click (Pinch Gesture)
-                    # Calculate distance between thumb and index tips
-                    dist = math.hypot(index_tip.x - thumb_tip.x, index_tip.y - thumb_tip.y)
-                    
-                    if dist < 0.05: # Threshold for a pinch
-                        pyautogui.click()
-                        cv2.circle(img, (int(index_tip.x * w), int(index_tip.y * h)), 15, (0, 255, 0), cv2.FILLED)
-                        pyautogui.sleep(0.1) # Debounce
+                # Vector Calculus: Euclidean distance for click detection
+                dist = np.linalg.norm(np.array([idx_tip.x, idx_tip.y]) - np.array([thumb_tip.x, thumb_tip.y]))
+                if dist < 0.05:
+                    pyautogui.click()
+                    pyautogui.sleep(0.2) # Debounce
 
-            # Visual UI Window
-            cv2.rectangle(img, (self.frame_pad, self.frame_pad), (w-self.frame_pad, h-self.frame_pad), (255, 0, 255), 2)
-            cv2.imshow("Jarvis Vision", img)
-            
-            if cv2.waitKey(1) & 0xFF == ord('q'):
+            # Output rendering
+            cv2.imshow("Vision Interface", frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'): 
                 break
 
+        # Resource deallocation
         self.cap.release()
         cv2.destroyAllWindows()
 
 if __name__ == "__main__":
-    ui = JarvisInterface()
-    ui.start_system()
+    app = ModernVisionUI()
+    app.execute()
